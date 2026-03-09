@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 DNSSEC Zone Walking Tester
-Uses dnspython (dns.resolver, dns.query, dns.dnssec) — zero subprocess calls.
 
 Install:
     pip install dnspython
