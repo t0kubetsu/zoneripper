@@ -6,32 +6,38 @@ Uses dnspython (dns.resolver, dns.query, dns.dnssec) — zero subprocess calls.
 Install:
     pip install dnspython
 
-Usage:
+Usage (CLI):
     python3 dnssec_zone_walk.py <domain> [--max-steps N] [--nameserver IP]
+
+Usage (module):
+    from dnssec_zone_walk import run
+    results = run("example.com", max_steps=100, nameserver="8.8.8.8")
 
 Examples:
     python3 dnssec_zone_walk.py example.com
     python3 dnssec_zone_walk.py example.com --max-steps 100 --nameserver 8.8.8.8
 """
 
-import argparse
 import sys
+import argparse
+import logging
 from typing import Optional
 
 try:
+    import dns.resolver
     import dns.dnssec
-    import dns.exception
-    import dns.flags
+    import dns.query
     import dns.message
     import dns.name
-    import dns.query
-    import dns.rcode
     import dns.rdatatype
-    import dns.resolver
+    import dns.flags
+    import dns.exception
+    import dns.rcode
 except ImportError:
-    print("Error: dnspython is not installed.")
-    print("Run:  pip install dnspython")
+    logging.critical("dnspython is not installed. Run: pip install dnspython")
     sys.exit(1)
+
+log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -244,28 +250,29 @@ def walk_zone(
     trap_streak = 0  # consecutive invalid names
     MAX_TRAP_STREAK = 3  # abort after this many in a row
 
-    print(f"\n  {'Owner':<48} Next →")
-    print(f"  {'-' * 48} ------")
+    log.debug("%-48s  %s", "Owner", "Next →")
+    log.debug("%s  %s", "-" * 48, "------")
 
     for step in range(max_steps):
         if current in seen:
-            print(f"\n  [Loop at '{current}'] — walk complete.")
+            log.info("Loop detected at '%s' — walk complete.", current)
             break
         seen.add(current)
 
         next_name, types = get_nsec_record(current, ns_ip)
 
         if not next_name:
-            print(f"  {current:<48} (no NSEC record — stopping)")
+            log.info("%-48s  (no NSEC record — stopping)", current)
             break
 
         # ── Trap / synthetic name detection ──────────────────
         if not is_valid_zone_name(next_name, domain):
             trap_streak += 1
-            print(f"  {current:<48} ⚠ synthetic next='{next_name}' (skipping)")
+            log.warning("%-48s  synthetic next='%s' (skipping)", current, next_name)
             if trap_streak >= MAX_TRAP_STREAK:
-                print(
-                    f"\n  Detected trap pattern ({trap_streak} consecutive synthetic names) — aborting walk."
+                log.warning(
+                    "Detected trap pattern (%d consecutive synthetic names) — aborting walk.",
+                    trap_streak,
                 )
                 break
             # Jump past the trap: query the synthetic name directly
@@ -275,35 +282,128 @@ def walk_zone(
 
         trap_streak = 0  # reset on a valid name
 
-        print(f"  {current:<48} {next_name}")
+        log.info("%-48s  %s", current, next_name)
 
         if current != domain and is_valid_zone_name(current, domain):
             discovered.append({"name": current, "types": types})
 
         # Full loop back to apex
         if next_name == domain:
-            print(f"\n  Returned to zone apex — full loop completed.")
+            log.info("Returned to zone apex — full loop completed.")
             break
 
         # Left the zone
         if not (next_name.endswith(f".{domain}") or next_name == domain):
-            print(f"\n  Next name '{next_name}' is outside zone — stopping.")
+            log.info("Next name '%s' is outside zone — stopping.", next_name)
             break
 
         current = next_name
 
     else:
-        print(f"\n  Reached max-steps limit ({max_steps}).")
+        log.warning("Reached max-steps limit (%d).", max_steps)
 
     return discovered
 
 
 # ─────────────────────────────────────────────────────────────
-# Entry point
+# Public API (importable as a module)
 # ─────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def run(
+    domain: str,
+    max_steps: int = 50,
+    nameserver: Optional[str] = None,
+) -> list[dict]:
+    """
+    Run a full DNSSEC zone-walking test against *domain*.
+
+    Parameters
+    ----------
+    domain      : Zone apex to test (e.g. "example.com").
+    max_steps   : Maximum NSEC hops to follow.
+    nameserver  : Optional resolver IP; uses the system resolver when None.
+
+    Returns
+    -------
+    List of {"name": str, "types": [str]} dicts for every real owner
+    name discovered, or an empty list when the zone is not walkable.
+    """
+    domain = domain.strip().rstrip(".")
+    resolver = make_resolver(nameserver)
+
+    SEP = "=" * 60
+    log.info(SEP)
+    log.info("DNSSEC Zone Walking Tester  —  dnspython")
+    log.info("Target     : %s", domain)
+    if nameserver:
+        log.info("Nameserver : %s", nameserver)
+    log.info(SEP)
+
+    # ── 1. DNSSEC enabled? ──────────────────────────────────
+    log.info("[1] Querying DNSKEY records...")
+    if not check_dnssec_enabled(domain, resolver):
+        log.warning("No DNSKEY found — DNSSEC is NOT enabled on '%s'.", domain)
+        log.warning("Zone walking requires DNSSEC; nothing to test.")
+        return []
+    log.info("DNSKEY records present — DNSSEC is ENABLED.")
+
+    # ── 2. Resolve authoritative NS ─────────────────────────
+    log.info("[2] Resolving authoritative nameserver...")
+    ns_ip = get_zone_nameserver_ip(domain, resolver)
+    if not ns_ip:
+        ns_ip = nameserver or resolver.nameservers[0]
+        log.warning("Could not resolve NS; falling back to %s", ns_ip)
+    else:
+        log.info("Authoritative NS IP: %s", ns_ip)
+
+    # ── 3. NSEC vs NSEC3 ────────────────────────────────────
+    log.info("[3] Detecting denial-of-existence mechanism...")
+    nsec_type = detect_nsec_type(domain, ns_ip)
+
+    if nsec_type == "NSEC3":
+        log.info("NSEC3 detected — NOT vulnerable to zone walking.")
+        log.info("Owner names are hashed; enumeration is not directly possible.")
+        log.info("Verdict: %s is SAFE.", domain)
+        return []
+    elif nsec_type == "NSEC":
+        log.warning("Plain NSEC detected — potentially VULNERABLE to zone walking!")
+    else:
+        log.warning("Could not detect NSEC type — attempting walk anyway...")
+
+    # ── 4. Walk ─────────────────────────────────────────────
+    log.info("[4] Attempting NSEC zone walk...")
+    discovered = walk_zone(domain, ns_ip, max_steps=max_steps)
+
+    # ── 5. Report ────────────────────────────────────────────
+    log.info("[5] Results")
+    log.info(SEP)
+    if discovered:
+        log.info("Enumerated %d name(s):", len(discovered))
+        log.info("%-48s  RR Types", "Hostname")
+        log.info("%s  %s", "-" * 48, "--------")
+        for entry in discovered:
+            types_str = ", ".join(entry["types"]) if entry["types"] else "—"
+            log.info("%-48s  %s", entry["name"], types_str)
+        log.warning("Verdict: VULNERABLE — zone walking succeeded on '%s'.", domain)
+        log.warning(
+            "Remediation: Migrate to NSEC3 (RFC 5155) with opt-out to prevent enumeration."
+        )
+    else:
+        log.info("No names enumerated via zone walking.")
+        log.info("Verdict: No zone walking exposure detected on '%s'.", domain)
+
+    log.info(SEP)
+    return discovered
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Build and return parsed CLI arguments (separated for testability)."""
     parser = argparse.ArgumentParser(
         description="Test DNSSEC zone walking vulnerability (uses dnspython, no subprocess)."
     )
@@ -320,75 +420,29 @@ def main() -> None:
         metavar="IP",
         help="Force a specific resolver IP (default: system resolver)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity (default: INFO)",
+    )
+    return parser.parse_args(argv)
 
-    domain = args.domain.strip().rstrip(".")
-    resolver = make_resolver(args.nameserver)
 
-    SEP = "=" * 60
-    print(SEP)
-    print("  DNSSEC Zone Walking Tester  —  dnspython")
-    print(f"  Target     : {domain}")
-    if args.nameserver:
-        print(f"  Nameserver : {args.nameserver}")
-    print(SEP)
+def main(argv: Optional[list[str]] = None) -> None:
+    """CLI entry point — parses arguments and delegates to run()."""
+    args = parse_args(argv)
 
-    # ── 1. DNSSEC enabled? ──────────────────────────────────
-    print("\n[1] Querying DNSKEY records...")
-    if not check_dnssec_enabled(domain, resolver):
-        print(f"  ✘  No DNSKEY found — DNSSEC is NOT enabled on '{domain}'.")
-        print("     Zone walking requires DNSSEC; nothing to test.")
-        sys.exit(0)
-    print(f"  ✔  DNSKEY records present — DNSSEC is ENABLED.")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)-8s %(message)s",
+    )
 
-    # ── 2. Resolve authoritative NS ─────────────────────────
-    print("\n[2] Resolving authoritative nameserver...")
-    ns_ip = get_zone_nameserver_ip(domain, resolver)
-    if not ns_ip:
-        ns_ip = args.nameserver or resolver.nameservers[0]
-        print(f"  (Could not resolve NS; falling back to {ns_ip})")
-    else:
-        print(f"  ✔  Authoritative NS IP: {ns_ip}")
-
-    # ── 3. NSEC vs NSEC3 ────────────────────────────────────
-    print("\n[3] Detecting denial-of-existence mechanism...")
-    nsec_type = detect_nsec_type(domain, ns_ip)
-
-    if nsec_type == "NSEC3":
-        print("  ✔  NSEC3 detected — NOT vulnerable to zone walking.")
-        print("     (Owner names are hashed; enumeration is not directly possible.)")
-        print(f"\n  Verdict: {domain} is SAFE.\n{SEP}\n")
-        sys.exit(0)
-    elif nsec_type == "NSEC":
-        print("  ⚠   Plain NSEC detected — potentially VULNERABLE to zone walking!")
-    else:
-        print("  ?  Could not detect NSEC type — attempting walk anyway...")
-
-    # ── 4. Walk ─────────────────────────────────────────────
-    print("\n[4] Attempting NSEC zone walk...")
-    discovered = walk_zone(domain, ns_ip, max_steps=args.max_steps)
-
-    # ── 5. Report ────────────────────────────────────────────
-    print(f"\n[5] Results")
-    print(SEP)
-    if discovered:
-        print(f"  Enumerated {len(discovered)} name(s):\n")
-        print(f"  {'Hostname':<48} RR Types")
-        print(f"  {'-' * 48} --------")
-        for entry in discovered:
-            types_str = ", ".join(entry["types"]) if entry["types"] else "—"
-            print(f"  {entry['name']:<48} {types_str}")
-        print(
-            f"\n  Verdict     : ⚠   VULNERABLE — zone walking succeeded on '{domain}'."
-        )
-        print(
-            "  Remediation : Migrate to NSEC3 (RFC 5155) with opt-out to prevent enumeration."
-        )
-    else:
-        print("  No names enumerated via zone walking.")
-        print(f"\n  Verdict: No zone walking exposure detected on '{domain}'.")
-
-    print(SEP)
+    run(
+        domain=args.domain,
+        max_steps=args.max_steps,
+        nameserver=args.nameserver,
+    )
 
 
 if __name__ == "__main__":
