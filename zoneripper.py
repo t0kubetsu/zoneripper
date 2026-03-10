@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-DNSSEC Zone Walking Tester
+ZoneRipper - DNSSEC Zone Walking Tester
 
 Install:
     pip install dnspython
 
 Usage (CLI):
-    python3 dnssec_zone_walk.py <domain> [options]
+    python3 zoneripper.py <domain> [options]
 
 Usage (module):
-    from dnssec_zone_walk import run
+    from zoneripper import run
     results = run("example.com", max_steps=100, nameserver="8.8.8.8")
 
 Examples:
-    python3 dnssec_zone_walk.py example.com
-    python3 dnssec_zone_walk.py example.com --max-steps 100 --nameserver 8.8.8.8
-    python3 dnssec_zone_walk.py example.com --wordlist words.txt
+    python3 zoneripper.py example.com
+    python3 zoneripper.py example.com --max-steps 100 --nameserver 8.8.8.8
+    python3 zoneripper.py example.com --wordlist words.txt
 """
 
 import argparse
