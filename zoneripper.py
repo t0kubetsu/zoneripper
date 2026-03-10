@@ -580,22 +580,20 @@ def find_candidate_for_any_gap(
     iterations: int,
     gaps: list[tuple[bytes, bytes]],
     label_iter,
-    max_tries: int = 500_000,
 ) -> tuple[str, bytes, tuple[bytes, bytes]] | None:
     """
     Consume labels from the shared iterator until one hashes into any gap.
 
     Checking every label against all gaps at once ensures no label is ever
-    wasted — if a hash misses the largest gap but falls into a smaller one,
-    it is still used immediately.
+    wasted — if a hash misses one gap but falls into another, it is still
+    used immediately.
 
-    Returns (label, raw_hash, matching_gap) or None if max_tries exhausted.
+    Iterates indefinitely until a match is found. Termination is guaranteed
+    because _label_generator covers the full label space and the hash space
+    is finite — every gap will eventually be hit.
     """
-    for _ in range(max_tries):
-        try:
-            label = next(label_iter)
-        except StopIteration:
-            return None
+    while True:
+        label = next(label_iter)
         try:
             raw = _nsec3_hash(label, domain, salt, iterations)
         except (ValueError, UnicodeEncodeError):
@@ -603,7 +601,6 @@ def find_candidate_for_any_gap(
         for gap in gaps:
             if _hash_falls_in_gap(raw, gap[0], gap[1]):
                 return label, raw, gap
-    return None
 
 
 def collect_nsec3_hashes(
@@ -708,20 +705,13 @@ def collect_nsec3_hashes(
             len(result.hashes),
         )
 
-        hit = find_candidate_for_any_gap(
+        label, _, matched_gap = find_candidate_for_any_gap(
             domain,
             result.params.salt,
             result.params.iterations,
             gaps,
             label_iter,
         )
-        if hit is None:
-            log.warning(
-                "Label space exhausted — could not fill remaining %d gap(s).", len(gaps)
-            )
-            break
-
-        label, _, matched_gap = hit
         log.debug(
             "  label=%-12s  matched gap %s…%s",
             label,
