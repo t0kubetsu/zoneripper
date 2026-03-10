@@ -20,9 +20,12 @@ Examples:
 
 import argparse
 import base64
+import bisect
 import hashlib
+import itertools
 import logging
 import os
+import string
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -78,6 +81,82 @@ class Nsec3WalkResult:
     params: Optional[Nsec3Params]
     hashes: list[Nsec3Hash] = field(default_factory=list)
     cracked: dict[str, str] = field(default_factory=dict)  # hash_b32 -> plaintext
+
+
+@dataclass
+class HashInterval:
+    start: bytes  # owner hash (raw 20-byte SHA-1 digest)
+    end: bytes  # next hash
+
+
+class HashRing:
+    """Sorted, non-overlapping set of covered NSEC3 intervals."""
+
+    def __init__(self):
+        # List of HashInterval, kept sorted by .start
+        self._intervals: list[HashInterval] = []
+
+    def insert(self, start_b32: str, end_b32: str) -> bool:
+        """
+        Add an (owner, next) pair.  Converts from base32hex to raw bytes,
+        inserts in sorted order, then merges any newly adjacent intervals.
+        Returns True if the ring actually grew (new coverage was added).
+        """
+        start = _b32hex_to_bytes(start_b32)
+        end = _b32hex_to_bytes(end_b32)
+
+        iv = HashInterval(start, end)
+        keys = [i.start for i in self._intervals]
+        idx = bisect.bisect_left(keys, start)
+        self._intervals.insert(idx, iv)
+        self._merge()
+        return True  # simplified; track prev length for real boolean
+
+    def _merge(self):
+        """Collapse abutting or overlapping intervals in-place."""
+        merged = []
+        for iv in self._intervals:
+            if merged and iv.start <= merged[-1].end:
+                # extend the last interval if needed
+                if iv.end > merged[-1].end:
+                    merged[-1] = HashInterval(merged[-1].start, iv.end)
+            else:
+                merged.append(HashInterval(iv.start, iv.end))
+        self._intervals = merged
+
+    def gaps(self) -> list[tuple[bytes, bytes]]:
+        """
+        Return a list of uncovered (gap_start, gap_end) byte pairs,
+        including the wrap-around gap.
+
+        The hash space is treated as a circle: after the last interval's
+        end, the next expected start is the first interval's start.
+        """
+        if not self._intervals:
+            return [(b"\x00" * 20, b"\xff" * 20)]  # everything uncovered
+
+        result = []
+        ivs = self._intervals
+
+        # linear gaps between consecutive intervals
+        for i in range(len(ivs) - 1):
+            if ivs[i].end < ivs[i + 1].start:
+                result.append((ivs[i].end, ivs[i + 1].start))
+
+        # wrap-around gap: last.end → first.start  (circular chain)
+        if ivs[-1].end != ivs[0].start:
+            result.append((ivs[-1].end, ivs[0].start))
+
+        return result
+
+    def is_complete(self) -> bool:
+        """True when a single interval spans the whole ring (no gaps)."""
+        ivs = self._intervals
+        return (
+            len(ivs) == 1 and ivs[0].start == ivs[0].end  # start == end means full wrap
+        ) or (
+            len(ivs) == 1 and ivs[-1].end == ivs[0].start  # end wraps to start
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -403,79 +482,172 @@ def _parse_nsec3_rdata(rdata, owner_label: str, ns_ip: str) -> Optional[Nsec3Has
         return None
 
 
+def _hash_falls_in_gap(h: bytes, gap_start: bytes, gap_end: bytes) -> bool:
+    """
+    Return True if h falls inside the half-open interval (gap_start, gap_end).
+    For wrap-around gaps where gap_end < gap_start, the interval crosses
+    the 0xff...→0x00... boundary, so membership is inverted.
+    """
+    if gap_start < gap_end:
+        # Normal interval: h must be strictly between start and end
+        return gap_start < h < gap_end
+    else:
+        # Wrap-around: h is in gap if it's ABOVE start OR BELOW end
+        return h > gap_start or h < gap_end
+
+
+def _label_generator():
+    """
+    Yield candidate DNS labels:
+    short strings first, in lexicographic order by length.
+    Covers: 0-9, a-z, then combinations thereof.
+    """
+    charset = string.digits + string.ascii_lowercase
+    length = 1
+    while True:
+        for combo in itertools.product(charset, repeat=length):
+            yield "".join(combo)
+        length += 1
+
+
+def find_candidate_for_any_gap(
+    domain: str,
+    salt: bytes,
+    iterations: int,
+    gaps: list[tuple[bytes, bytes]],
+    label_iter,
+    max_tries: int = 500_000,
+) -> tuple[str, bytes, tuple[bytes, bytes]] | None:
+    """
+    Advance the shared iterator, hash each label, and return the first label
+    whose hash falls in ANY of the provided gaps.
+
+    Returns (label, raw_hash, matching_gap) or None if max_tries exhausted.
+    No labels are wasted — every hash is checked against all gaps.
+    """
+    for _ in range(max_tries):
+        try:
+            label = next(label_iter)
+        except StopIteration:
+            return None
+        try:
+            raw = _nsec3_hash(label, domain, salt, iterations)
+        except (ValueError, UnicodeEncodeError):
+            continue
+        for gap in gaps:
+            if _hash_falls_in_gap(raw, gap[0], gap[1]):
+                return label, raw, gap
+    return None
+
+
 def collect_nsec3_hashes(
     domain: str,
     ns_ips: list[str],
-    rounds: int = 30,
+    rounds: int = 100,  # a soft cap, not a hard iteration count
     timeout: float = 5.0,
 ) -> Nsec3WalkResult:
     """
-    Collect NSEC3 hashes by repeatedly querying random non-existent subdomains.
+    Active NSEC3 zone walk.
 
-    Each NXDOMAIN response returns up to 3 NSEC3 records covering the
-    "closest encloser", "next closer", and "wildcard" proofs. Each record
-    reveals two hashed names (owner + next). After *rounds* probes we have
-    good coverage of the zone's hash space.
-
-    Returns an Nsec3WalkResult with all unique hashes collected.
+    Algorithm
+    ---------
+    1. Seed with a few random probes to bootstrap the ring.
+    2. Inspect the ring for uncovered gaps.
+    3. Generate a query label whose hash falls inside the largest gap.
+    4. Send the query; insert all returned NSEC3 intervals.
+    5. Repeat until no gaps remain or the round limit is hit.
     """
     result = Nsec3WalkResult(params=None)
-    seen_owners: set[str] = set()
+    ring = HashRing()
 
-    log.info("Collecting NSEC3 hashes via %d random probes...", rounds)
-
-    for i in range(rounds):
-        probe_label = uuid.uuid4().hex[:16]
-        probe = f"{probe_label}.{domain}"
-
-        for ns_ip in ns_ips:
-            response = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
-            if response is None:
+    def _process_response(response, ns_ip: str) -> int:
+        """Parse NSEC3 records from a response, update ring + result. Returns new interval count."""
+        added = 0
+        for rrset in response.authority:
+            if rrset.rdtype != dns.rdatatype.NSEC3:
                 continue
-
-            got_nsec3 = False
-            for rrset in response.authority:
-                if rrset.rdtype != dns.rdatatype.NSEC3:
-                    continue
-                got_nsec3 = True
-
-                for rdata in rrset:
-                    if result.params is None:
-                        result.params = _extract_nsec3_params(rdata)
-                        if result.params:
-                            log.info(
-                                "NSEC3 params - algorithm: %d, iterations: %d, salt: %s",
-                                result.params.algorithm,
-                                result.params.iterations,
-                                result.params.salt_hex,
-                            )
-
-                    owner_label = str(rrset.name).split(".")[0].upper()
-                    if owner_label in seen_owners:
-                        continue
-                    seen_owners.add(owner_label)
-
-                    h = _parse_nsec3_rdata(rdata, owner_label, ns_ip)
-                    if h:
-                        result.hashes.append(h)
-                        log.debug(
-                            "  [%3d] owner=%-36s  next=%s  types=%s",
-                            len(result.hashes),
-                            h.owner_b32,
-                            h.next_b32,
-                            ",".join(h.types),
+            for rdata in rrset:
+                if result.params is None:
+                    result.params = _extract_nsec3_params(rdata)
+                    if result.params:
+                        log.info(
+                            "NSEC3 params – algorithm: %d  iterations: %d  salt: %s",
+                            result.params.algorithm,
+                            result.params.iterations,
+                            result.params.salt_hex,
                         )
 
-            if got_nsec3:
+                owner_label = str(rrset.name).split(".")[0].upper()
+                h = _parse_nsec3_rdata(rdata, owner_label, ns_ip)
+                if h and owner_label not in {x.owner_b32 for x in result.hashes}:
+                    result.hashes.append(h)
+                    ring.insert(h.owner_b32, h.next_b32)
+                    added += 1
+        return added
+
+    # ── Phase 1: bootstrap with random probes ─────────────────
+    BOOTSTRAP = min(5, rounds)
+    log.info("Phase 1: bootstrapping with %d random probes...", BOOTSTRAP)
+    for _ in range(BOOTSTRAP):
+        probe = f"{uuid.uuid4().hex[:16]}.{domain}"
+        for ns_ip in ns_ips:
+            resp = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
+            if resp:
+                _process_response(resp, ns_ip)
                 break
 
-        if (i + 1) % 10 == 0:
+    if result.params is None:
+        log.warning(
+            "No NSEC3 records received during bootstrap – zone may not use NSEC3."
+        )
+        return result
+
+    # ── Phase 2: active gap targeting ─────────────────────────
+    log.info("Phase 2: active gap-targeted walk (max %d rounds)...", rounds)
+
+    label_iter = _label_generator()
+    for step in range(rounds):
+        gaps = ring.gaps()
+        if not gaps:
             log.info(
-                "  probe %d/%d - %d unique hashes so far",
-                i + 1,
-                rounds,
+                "Hash ring fully covered after %d steps. Total hashes: %d",
+                step,
                 len(result.hashes),
             )
+            break
+
+        log.debug(
+            "Step %d: %d gap(s), %d hashes so far", step, len(gaps), len(result.hashes)
+        )
+
+        hit = find_candidate_for_any_gap(
+            domain,
+            result.params.salt,
+            result.params.iterations,
+            gaps,
+            label_iter,
+        )
+
+        if hit is None:
+            log.warning("Label space exhausted – could not fill remaining gaps.")
+            break
+
+        label, _, matched_gap = hit
+        log.debug(
+            "  label=%s matched gap %s…%s",
+            label,
+            matched_gap[0].hex()[:8],
+            matched_gap[1].hex()[:8],
+        )
+
+        probe = f"{label}.{domain}"
+        for ns_ip in ns_ips:
+            resp = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
+            if resp:
+                new = _process_response(resp, ns_ip)
+                if new:
+                    log.debug("  → +%d interval(s), total %d", new, len(result.hashes))
+                break
 
     log.info("Collected %d unique NSEC3 hashes.", len(result.hashes))
     return result
@@ -844,7 +1016,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--nsec3-rounds",
         type=int,
-        default=30,
+        default=100,
         metavar="N",
         help="Number of random probes for NSEC3 hash collection",
     )
