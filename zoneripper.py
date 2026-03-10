@@ -105,19 +105,33 @@ class HashRing:
         start = _b32hex_to_bytes(start_b32)
         end = _b32hex_to_bytes(end_b32)
 
-        iv = HashInterval(start, end)
-        keys = [i.start for i in self._intervals]
-        idx = bisect.bisect_left(keys, start)
-        self._intervals.insert(idx, iv)
+        if start < end:
+            # Normal interval — insert as-is
+            intervals_to_add = [HashInterval(start, end)]
+        else:
+            # Wrap-around interval (last record in zone points back to first hash)
+            # Split into two linear segments:
+            #   [start → 0xff...ff]  and  [0x00...00 → end]
+            MAX = b"\xff" * 20
+            MIN = b"\x00" * 20
+            intervals_to_add = [
+                HashInterval(start, MAX),
+                HashInterval(MIN, end),
+            ]
+
+        for iv in intervals_to_add:
+            keys = [i.start for i in self._intervals]
+            idx = bisect.bisect_left(keys, iv.start)
+            self._intervals.insert(idx, iv)
+
         self._merge()
-        return True  # simplified; track prev length for real boolean
+        return True
 
     def _merge(self):
-        """Collapse abutting or overlapping intervals in-place."""
+        """Collapse abutting or overlapping intervals in-place (linear only)."""
         merged = []
         for iv in self._intervals:
             if merged and iv.start <= merged[-1].end:
-                # extend the last interval if needed
                 if iv.end > merged[-1].end:
                     merged[-1] = HashInterval(merged[-1].start, iv.end)
             else:
@@ -132,31 +146,33 @@ class HashRing:
         The hash space is treated as a circle: after the last interval's
         end, the next expected start is the first interval's start.
         """
+        MIN = b"\x00" * 20
+        MAX = b"\xff" * 20
+
         if not self._intervals:
-            return [(b"\x00" * 20, b"\xff" * 20)]  # everything uncovered
+            return [(MIN, MAX)]
 
         result = []
         ivs = self._intervals
 
-        # linear gaps between consecutive intervals
+        # Gap before the first interval
+        if ivs[0].start > MIN:
+            result.append((MIN, ivs[0].start))
+
+        # Gaps between consecutive intervals
         for i in range(len(ivs) - 1):
             if ivs[i].end < ivs[i + 1].start:
                 result.append((ivs[i].end, ivs[i + 1].start))
 
-        # wrap-around gap: last.end → first.start  (circular chain)
-        if ivs[-1].end != ivs[0].start:
-            result.append((ivs[-1].end, ivs[0].start))
+        # Gap after the last interval
+        if ivs[-1].end < MAX:
+            result.append((ivs[-1].end, MAX))
 
         return result
 
-    def is_complete(self) -> bool:
-        """True when a single interval spans the whole ring (no gaps)."""
-        ivs = self._intervals
-        return (
-            len(ivs) == 1 and ivs[0].start == ivs[0].end  # start == end means full wrap
-        ) or (
-            len(ivs) == 1 and ivs[-1].end == ivs[0].start  # end wraps to start
-        )
+        def is_complete(self) -> bool:
+            """True when there are no gaps in the ring."""
+            return len(self.gaps()) == 0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -563,38 +579,36 @@ def collect_nsec3_hashes(
     def _process_response(response, ns_ip: str) -> int:
         """Parse NSEC3 records from a response, update ring + result. Returns new interval count."""
         added = 0
-        for rrset in response.authority:
-            if rrset.rdtype != dns.rdatatype.NSEC3:
-                continue
-            for rdata in rrset:
-                if result.params is None:
-                    result.params = _extract_nsec3_params(rdata)
-                    if result.params:
-                        log.info(
-                            "NSEC3 params – algorithm: %d  iterations: %d  salt: %s",
-                            result.params.algorithm,
-                            result.params.iterations,
-                            result.params.salt_hex,
-                        )
+        for section in (response.answer, response.authority):
+            for rrset in section:
+                if rrset.rdtype != dns.rdatatype.NSEC3:
+                    continue
+                for rdata in rrset:
+                    if result.params is None:
+                        result.params = _extract_nsec3_params(rdata)
+                        if result.params:
+                            log.info(
+                                "NSEC3 params – algorithm: %d  iterations: %d  salt: %s",
+                                result.params.algorithm,
+                                result.params.iterations,
+                                result.params.salt_hex,
+                            )
 
-                owner_label = str(rrset.name).split(".")[0].upper()
-                h = _parse_nsec3_rdata(rdata, owner_label, ns_ip)
-                if h and owner_label not in {x.owner_b32 for x in result.hashes}:
-                    result.hashes.append(h)
-                    ring.insert(h.owner_b32, h.next_b32)
-                    added += 1
+                    owner_label = str(rrset.name).split(".")[0].upper()
+                    h = _parse_nsec3_rdata(rdata, owner_label, ns_ip)
+                    if h and owner_label not in {x.owner_b32 for x in result.hashes}:
+                        result.hashes.append(h)
+                        ring.insert(h.owner_b32, h.next_b32)
+                        added += 1
         return added
 
     # ── Phase 1: bootstrap with random probes ─────────────────
-    BOOTSTRAP = min(5, rounds)
-    log.info("Phase 1: bootstrapping with %d random probes...", BOOTSTRAP)
-    for _ in range(BOOTSTRAP):
-        probe = f"{uuid.uuid4().hex[:16]}.{domain}"
-        for ns_ip in ns_ips:
-            resp = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
-            if resp:
-                _process_response(resp, ns_ip)
-                break
+    log.info("Phase 1: bootstrapping with apex query...")
+    for ns_ip in ns_ips:
+        resp = udp_query(f"0.{domain}", dns.rdatatype.A, ns_ip, timeout)
+        if resp:
+            _process_response(resp, ns_ip)
+            break
 
     if result.params is None:
         log.warning(
